@@ -19,3 +19,5 @@ resources/prod/config.py
 # Local data
 Datamart_data/
 *.csv
+
+*.log
