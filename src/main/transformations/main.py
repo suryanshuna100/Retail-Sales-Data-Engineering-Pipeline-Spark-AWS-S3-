@@ -13,6 +13,8 @@ from src.main.read.database_read import DatabaseReader
 from src.main.transformations.dimension_tables_join import dimesions_table_join
 from pyspark.sql.functions import concat_ws, expr, lit
 from pyspark.sql.types import StructType, StructField, StringType, DateType, IntegerType, FloatType
+from src.main.write.format_writer import FormatWriter
+from src.main.upload.upload_to_s3 import UploadToS3
 
 
 
@@ -190,7 +192,7 @@ if correct_files:
     cursor = connection.cursor()
     logger.info("****connected with mySQL connection *********")
     for statement in insert_statement:
-        cursor.execute(statement, (file_name, file, formatted_date))
+        cursor.execute(statement)
         connection.commit()
     cursor.close()
     connection.close()
@@ -278,3 +280,87 @@ s3_customer_stores_sales_df_join = dimesions_table_join(final_df_to_process, cus
 logger.info("*********Final enriched dataframe with all the dimension tables joined*********")
 s3_customer_stores_sales_df_join.show(truncate = False)
 
+#Write the customer data into customer data mart in parquet format
+
+logger.info("*******write the data into customer data mart*******")
+
+final_customer_data_mart_df = s3_customer_stores_sales_df_join\
+                                .select("ct.customer_id",
+                                        "ct.first_name",
+                                        "ct.last_name",
+                                        "ct.address",
+                                        "ct.pincode",
+                                        "phone_number",
+                                        "sales_date", #coming from fact table
+                                        "total_cost" #coming from fact table
+                                        )
+logger.info("*********Final dataframe for customer data mart*********")
+final_customer_data_mart_df.show(truncate = False)
+
+
+#file will be written to local first
+parquet_writer = FormatWriter("overwrite","parquet")
+parquet_writer.dataframe_writer(final_customer_data_mart_df, config.customer_data_mart_local_file)
+
+logger.info(f"*********Customer data written into parquet format at {config.customer_data_mart_local_file} successfully*********")
+#Move the data on s3 bucket for customer data mart
+logger.info("*********Moving the customer data from local to s3 bucket for customer data mart*********")
+s3_uploader = UploadToS3(s3_client)
+s3_directory_customer = config.s3_customer_datamart_directory
+bucket_name = config.bucket_name
+message = s3_uploader.upload_to_s3(s3_directory_customer,bucket_name,config.customer_data_mart_local_file)
+logger.info(f"{message}")
+
+#sales_team data mart
+logger.info("*******write the data into sales_team data mart*******")
+final_sales_team_data_mart_df = s3_customer_stores_sales_df_join\
+                                .select("store_id",
+                                        # "store_name",
+                                        "sales_person_id",
+                                        "sales_person_first_name",
+                                        "sales_person_last_name",
+                                        "store_manager_name",
+                                        "manager_id",
+                                        "is_manager",
+                                        "sales_person_address",
+                                        "sales_person_pincode",
+                                        "sales_date", #coming from fact table
+                                        "total_cost" ,#coming from fact table
+                                        expr("substring(sales_date, 1, 7)").alias("sales_month") 
+                                )
+
+logger.info("*********Final data for sales_team data mart*********")
+final_sales_team_data_mart_df.show(truncate = False)
+parquet_writer.dataframe_writer(final_sales_team_data_mart_df, config.sales_team_data_mart_local_file)
+logger.info(f"*********Sales team data written into parquet format locally at {config.sales_team_data_mart_local_file} successfully*********")
+
+#Move the data on s3 bucket for sales_team data mart
+s3_directory_sales = config.s3_sales_datamart_directory
+message = s3_uploader.upload_to_s3(s3_directory_sales,
+                                   config.bucket_name,
+                                   config.sales_team_data_mart_local_file
+                                   )
+logger.info(f"{message}")
+
+#also writing the data into partitions
+final_sales_team_data_mart_df.write.format("parquet") \
+    .option("header", "true") \
+    .mode("overwrite") \
+    .partitionBy("sales_month", "store_id") \
+    .option("path", config.sales_team_data_mart_partitioned_local_file) \
+    .save()
+
+logger.info(f"*********Sales team data written into partitioned parquet format locally at {config.sales_team_data_mart_partitioned_local_file} successfully*********")
+
+#move data on s3 for partitioned folder
+s3_prefix = "sales_partition_data"
+current_epoch = int(datetime.now().timestamp()) * 1000
+for root, dirs, files in os.walk(config.sales_team_data_mart_partitioned_local_file):
+    for file in files:
+        logger.info(f"Processing file: {file}")
+        local_file_path = os.path.join(root, file)
+        relative_path = os.path.relpath(local_file_path, config.sales_team_data_mart_partitioned_local_file)
+        s3_key = f"{s3_prefix}/{current_epoch}/{relative_path}"
+        s3_client.upload_file(local_file_path, config.bucket_name, s3_key)
+
+logger.info(f"Partitioned data uploaded to s3://{config.bucket_name}/{s3_prefix}/{current_epoch}/")
