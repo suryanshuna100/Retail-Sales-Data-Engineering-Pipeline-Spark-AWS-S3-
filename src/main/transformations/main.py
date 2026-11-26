@@ -15,7 +15,9 @@ from pyspark.sql.functions import concat_ws, expr, lit
 from pyspark.sql.types import StructType, StructField, StringType, DateType, IntegerType, FloatType
 from src.main.write.format_writer import FormatWriter
 from src.main.upload.upload_to_s3 import UploadToS3
-
+from src.main.transformations.customer_datamart_transform_sql_write import customer_mart_calculation_table_write
+from src.main.transformations.sales_mart_transformation_sql_write import sales_mart_calculation_table_write
+from src.main.delete.local_file_delete import delete_local_file
 
 
 aws_access_key = config.aws_access_key
@@ -364,3 +366,72 @@ for root, dirs, files in os.walk(config.sales_team_data_mart_partitioned_local_f
         s3_client.upload_file(local_file_path, config.bucket_name, s3_key)
 
 logger.info(f"Partitioned data uploaded to s3://{config.bucket_name}/{s3_prefix}/{current_epoch}/")
+
+#calculation for customer mart
+#find out the customer total purchase every month
+#write the data into mysql table
+
+logger.info("*********Calculating the customer total purchase every month*********")
+customer_mart_calculation_table_write(final_customer_data_mart_df)
+logger.info("*********Customer total purchase every month written into mysql table successfully*********")
+
+# Calculation for sales team mart
+# Find out the total sales done by each sales person every month
+# give the top performer 1% incentive of total sales of the month
+# rest sales person will get nothing
+# Write the data into MySQL table
+
+logger.info("***********calculating sales every month billed amount***********")
+
+sales_mart_calculation_table_write(final_sales_team_data_mart_df)
+
+logger.info("********calculation of sales mart done and written into the mySQL table**********")
+
+#move the file on s3 into processed folder
+source_prefix = config.s3_source_directory
+destination_prefix = config.s3_processed_directory
+message = move_s3_to_s3(s3_client, config.bucket_name, source_prefix, destination_prefix)
+logger.info(f'{message}')
+
+#delete the local file
+logger.info("***deleting the sales data from local****")
+delete_local_file(config.local_directory)
+logger.info("****Deleted sales data from local****")
+
+logger.info("*******deleting customer data from local******")
+delete_local_file(config.customer_data_mart_local_file)
+logger.info("****Deleted customer_data_mart_local_file from local****")
+
+logger.info("*******deleting sales_team_data_mart_local_file*****")
+delete_local_file(config.sales_team_data_mart_local_file)
+logger.info("****Deleted sales_team_data_mart_local_file from local****")
+
+delete_local_file(config.sales_team_data_mart_partitioned_local_file)
+logger.info("****Deleted sales_team_data_mart_partitioned_local_file from local****")
+
+#update the status of staging table
+update_statements = []
+if correct_files:
+    for file in correct_files:
+        file_name = os.path.basename(file)
+        statements = f"UPDATE {db_name}.{config.product_staging_table} " \
+                    f"SET status = 'I', updated_date = '{formatted_date}' " \
+                    f"WHERE file_name = '{file_name}'"
+
+        update_statements.append(statements)
+    logger.info(f"updated statements for the staging_table: {update_statements}")
+    logger.info("**********Connecting with My SQL Server **********")
+    connection = get_mysql_connection()
+    cursor = connection.cursor()
+    logger.info("**********Connection established with My SQL Server **********")
+    for statements in update_statements:
+        cursor.execute(statements)
+        connection.commit()
+    cursor.close()
+    connection.close()
+else:
+    logger.info("*******There is some error in between*******")
+    sys.exit()
+
+input("Press enter to terminate")
+
